@@ -27,13 +27,23 @@ class PetwalkBitBinarySensor : public binary_sensor::BinarySensor {
  public:
   void set_bit(uint8_t bit) { this->bit_ = bit; }
   void set_active_low(bool active_low) { this->active_low_ = active_low; }
+  void set_minimum_on_time(uint32_t milliseconds) { this->minimum_on_time_ms_ = milliseconds; }
+  void set_minimum_off_time(uint32_t milliseconds) { this->minimum_off_time_ms_ = milliseconds; }
   void publish_from_frame(const uint8_t *frame, uint8_t frame_bits);
 
  protected:
   uint8_t bit_{1};  // 1-based: bit 1 is the first sampled clock pulse.
   bool active_low_{true};
-  bool has_state_{false};
-  bool last_state_{false};
+
+  uint32_t minimum_on_time_ms_{0};
+  uint32_t minimum_off_time_ms_{0};
+
+  bool candidate_valid_{false};
+  bool candidate_state_{false};
+  uint32_t candidate_since_ms_{0};
+
+  bool published_valid_{false};
+  bool published_state_{false};
 };
 
 class PetwalkEsphome : public Component {

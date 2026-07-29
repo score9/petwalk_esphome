@@ -15,13 +15,29 @@ void PetwalkBitBinarySensor::publish_from_frame(const uint8_t *frame, uint8_t fr
 
   const bool raw = frame[this->bit_ - 1] != 0;
   const bool state = this->active_low_ ? !raw : raw;
+  const uint32_t now = millis();
 
-  // Avoid sending approximately 200 identical updates per second to Home Assistant.
-  if (!this->has_state_ || state != this->last_state_) {
-    this->last_state_ = state;
-    this->has_state_ = true;
-    this->publish_state(state);
+  // A changed raw value starts a new candidate period. If it changes back before
+  // the configured time expires, the short pulse is discarded automatically.
+  if (!this->candidate_valid_ || state != this->candidate_state_) {
+    this->candidate_valid_ = true;
+    this->candidate_state_ = state;
+    this->candidate_since_ms_ = now;
   }
+
+  // No need to republish the state that Home Assistant already knows.
+  if (this->published_valid_ && this->candidate_state_ == this->published_state_)
+    return;
+
+  const uint32_t required_ms = this->candidate_state_ ? this->minimum_on_time_ms_ : this->minimum_off_time_ms_;
+
+  // Unsigned subtraction intentionally handles millis() rollover.
+  if (static_cast<uint32_t>(now - this->candidate_since_ms_) < required_ms)
+    return;
+
+  this->published_state_ = this->candidate_state_;
+  this->published_valid_ = true;
+  this->publish_state(this->published_state_);
 }
 
 void PetwalkEsphome::setup() {
