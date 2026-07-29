@@ -1,0 +1,62 @@
+esphome:
+  name: petwalk-reader
+  friendly_name: Petwalk Reader
+
+esp8266:
+  board: nodemcuv2
+
+logger:
+api:
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source: github://YOUR_GITHUB_NAME/petwalk_esphome
+    components: [petwalk_esphome]
+    refresh: 1h
+
+petwalk_esphome:
+  id: petwalk_bus
+  data_pin:
+    number: D5
+    mode: INPUT
+  clock_pin:
+    number: D6
+    mode: INPUT
+  latch_pin:
+    number: D7
+    mode: INPUT
+  frame_bits: 56
+  clock_edge: FALLING
+  latch_edge: RISING
+  debug_frames: false
+
+binary_sensor:
+  - platform: petwalk_esphome
+    petwalk_esphome_id: petwalk_bus
+    bit: 6
+    active_low: true
+    name: "Petwalk ON"
+
+  - platform: petwalk_esphome
+    petwalk_esphome_id: petwalk_bus
+    bit: 9
+    active_low: true
+    name: "Petwalk Ausgangskontrolle"
+
+  - platform: petwalk_esphome
+    petwalk_esphome_id: petwalk_bus
+    bit: 11
+    active_low: true
+    name: "Petwalk Eingangskontrolle"
+
+  - platform: petwalk_esphome
+    petwalk_esphome_id: petwalk_bus
+    bit: 23
+    active_low: true
+    name: "Petwalk Tür"
+    device_class: door
