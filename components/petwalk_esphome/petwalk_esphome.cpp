@@ -269,7 +269,7 @@ bool PetwalkClockSyncButton::menu_pattern_detected_() const {
 }
 
 void PetwalkClockSyncButton::publish_from_frame(const uint8_t *frame, uint8_t frame_bits) {
-  if (this->state_ != State::WAIT_MENU || frame_bits < 23)
+  if ((this->state_ != State::WAIT_MENU && this->state_ != State::WAIT_AFTER_EXIT) || frame_bits < 23)
     return;
 
   for (size_t i = 0; i < MENU_BITS.size(); i++) {
@@ -349,6 +349,7 @@ void PetwalkClockSyncButton::press_action() {
   this->target_minute_ = static_cast<uint8_t>(target_total % 60U);
   this->previous_value_valid_ = false;
   this->aborting_ = false;
+  this->exit_retry_count_ = 0;
   this->reset_menu_detection_();
 
   ESP_LOGI(TAG, "Clock sync started; target is %02u:%02u", this->target_hour_, this->target_minute_);
@@ -477,18 +478,32 @@ void PetwalkClockSyncButton::loop() {
 
     case State::WAIT_AFTER_SAVE:
       if (static_cast<int32_t>(now_ms - this->not_before_ms_) >= 0) {
-        // Second separate logical OK key press after two seconds: leave menu.
+        // A second separate logical OK key press leaves the menu. We deliberately
+        // wait a little longer than before because the petWALK needs time after
+        // saving and starting its clock before it accepts the next key press.
+        this->reset_menu_detection_();
+        ESP_LOGI(TAG, "Clock sync: sending separate OK press to leave menu");
         this->send_key_(this->ok_command_);
-        this->not_before_ms_ = now_ms + 1500;
-        this->set_state_(State::WAIT_AFTER_EXIT, this->state_timeout_ms_);
+        this->not_before_ms_ = now_ms + 1800;
+        this->set_state_(State::WAIT_AFTER_EXIT, this->state_timeout_ms_ + 3000);
       }
       break;
 
     case State::WAIT_AFTER_EXIT:
       if (static_cast<int32_t>(now_ms - this->not_before_ms_) >= 0) {
-        ESP_LOGI(TAG, "Clock sync completed successfully");
-        this->state_ = State::IDLE;
-        this->aborting_ = false;
+        if (this->menu_pattern_detected_() && this->exit_retry_count_ < 1) {
+          // The menu is still active: retry one complete logical OK press.
+          this->exit_retry_count_++;
+          this->reset_menu_detection_();
+          ESP_LOGW(TAG, "Clock sync: menu still active, retrying exit OK press");
+          this->send_key_(this->ok_command_);
+          this->not_before_ms_ = now_ms + 1800;
+          this->set_state_(State::WAIT_AFTER_EXIT, this->state_timeout_ms_ + 3000);
+        } else {
+          ESP_LOGI(TAG, "Clock sync completed successfully");
+          this->state_ = State::IDLE;
+          this->aborting_ = false;
+        }
       }
       break;
 
