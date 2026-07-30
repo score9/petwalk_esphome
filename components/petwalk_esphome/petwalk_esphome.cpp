@@ -1,5 +1,6 @@
 #include "petwalk_esphome.h"
 
+#include <algorithm>
 #include <string>
 
 #include "esphome/core/log.h"
@@ -132,14 +133,13 @@ char PetwalkDisplayTextSensor::decode_mask_(uint8_t mask) const {
     case 0b1001111: return 'E';
     case 0b1000111: return 'F';
     case 0b0110111: return 'H';
-    case 0b0000110: return 'I';
     case 0b0001110: return 'L';
     case 0b1100111: return 'P';
     case 0b0111110: return 'U';
     case 0b0001101: return 'c';
     case 0b0111101: return 'd';
     case 0b0010111: return 'h';
-    case 0b0000100: return 'i';
+    case 0b0010000: return 'i';
     case 0b0010101: return 'n';
     case 0b0011101: return 'o';
     case 0b0000101: return 'r';
@@ -174,12 +174,34 @@ std::string PetwalkDisplayTextSensor::decode_display_(const uint8_t *frame, uint
   return digits;
 }
 
+bool PetwalkDisplayTextSensor::seen_recently(const std::string &value, uint32_t window_ms) const {
+  const uint32_t now = millis();
+  std::string current(this->raw_digits_.begin(), this->raw_digits_.end());
+  if (current == value)
+    return true;
+  return this->last_non_blank_raw_ == value &&
+         static_cast<uint32_t>(now - this->last_non_blank_time_ms_) <= window_ms;
+}
+
 void PetwalkDisplayTextSensor::publish_from_frame(const uint8_t *frame, uint8_t frame_bits) {
   if (frame_bits < 56)
     return;
 
-  const std::string state = this->decode_display_(frame, frame_bits);
   const uint32_t now = millis();
+  bool any_non_blank = false;
+  for (uint8_t position = 1; position <= 4; position++) {
+    const char value = this->decode_digit_(frame, frame_bits, position);
+    this->raw_digits_[position - 1] = value;
+    if (value != ' ')
+      any_non_blank = true;
+  }
+  this->last_frame_time_ms_ = now;
+  if (any_non_blank) {
+    this->last_non_blank_raw_.assign(this->raw_digits_.begin(), this->raw_digits_.end());
+    this->last_non_blank_time_ms_ = now;
+  }
+
+  const std::string state = this->decode_display_(frame, frame_bits);
 
   if (!this->candidate_valid_ || state != this->candidate_state_) {
     this->candidate_valid_ = true;
@@ -196,6 +218,296 @@ void PetwalkDisplayTextSensor::publish_from_frame(const uint8_t *frame, uint8_t 
   this->published_state_ = this->candidate_state_;
   this->published_valid_ = true;
   this->publish_state(this->published_state_);
+}
+
+
+constexpr std::array<uint8_t, 7> PetwalkClockSyncButton::MENU_BITS;
+
+void PetwalkClockSyncButton::dump_config() {
+  ESP_LOGCONFIG(TAG, "petWALK clock sync button:");
+  ESP_LOGCONFIG(TAG, "  RC5 address: 0x%02X", this->address_);
+  ESP_LOGCONFIG(TAG, "  Commands: MENU=0x%02X TIME_PROGRAM=0x%02X OK=0x%02X UP=0x%02X DOWN=0x%02X",
+                this->menu_command_, this->time_program_command_, this->ok_command_, this->up_command_,
+                this->down_command_);
+  ESP_LOGCONFIG(TAG, "  Logical key press: 2 RC5 frames, %u us apart", static_cast<unsigned>(this->repeat_wait_us_));
+  ESP_LOGCONFIG(TAG, "  Delay between two logical MENU/OK presses: %u ms",
+                static_cast<unsigned>(this->second_press_delay_ms_));
+  ESP_LOGCONFIG(TAG, "  Target lead: %u minute(s)", this->target_lead_minutes_);
+}
+
+void PetwalkClockSyncButton::send_key_(uint8_t command) {
+  if (this->transmitter_ == nullptr)
+    return;
+  remote_base::RC5Data data{};
+  data.address = this->address_;
+  data.command = command;
+  // One logical key press is always exactly two equal RC5 commands with 82 ms
+  // (configurable) between them. A single RC5 command is ignored by petWALK.
+  this->transmitter_->transmit<remote_base::RC5Protocol>(data, 2, this->repeat_wait_us_);
+  ESP_LOGD(TAG, "Clock sync: key command=0x%02X (2 frames, %u us gap)", command,
+           static_cast<unsigned>(this->repeat_wait_us_));
+}
+
+void PetwalkClockSyncButton::set_state_(State state, uint32_t timeout_ms) {
+  this->state_ = state;
+  this->state_since_ms_ = millis();
+  this->state_deadline_ms_ = timeout_ms == 0 ? 0 : this->state_since_ms_ + timeout_ms;
+}
+
+void PetwalkClockSyncButton::reset_menu_detection_() {
+  this->menu_state_valid_.fill(false);
+  this->menu_toggle_counts_.fill(0);
+}
+
+bool PetwalkClockSyncButton::menu_pattern_detected_() const {
+  uint8_t toggling = 0;
+  for (uint8_t count : this->menu_toggle_counts_) {
+    if (count >= 2)
+      toggling++;
+  }
+  return toggling >= 5;
+}
+
+void PetwalkClockSyncButton::publish_from_frame(const uint8_t *frame, uint8_t frame_bits) {
+  if (this->state_ != State::WAIT_MENU || frame_bits < 23)
+    return;
+
+  for (size_t i = 0; i < MENU_BITS.size(); i++) {
+    const uint8_t bit = MENU_BITS[i];
+    const bool state = frame[bit - 1] == 0;  // petWALK LEDs are active-low.
+    if (!this->menu_state_valid_[i]) {
+      this->menu_state_valid_[i] = true;
+      this->menu_last_states_[i] = state;
+    } else if (state != this->menu_last_states_[i]) {
+      this->menu_last_states_[i] = state;
+      if (this->menu_toggle_counts_[i] < 255)
+        this->menu_toggle_counts_[i]++;
+    }
+  }
+}
+
+bool PetwalkClockSyncButton::parse_hour_(uint8_t &hour) const {
+  if (this->display_ == nullptr)
+    return false;
+  const auto &d = this->display_->get_raw_digits();
+  if (d[0] < '0' || d[0] > '9' || d[1] < '0' || d[1] > '9' || d[2] != ' ' || d[3] != ' ')
+    return false;
+  const uint8_t value = static_cast<uint8_t>((d[0] - '0') * 10 + (d[1] - '0'));
+  if (value > 23)
+    return false;
+  hour = value;
+  return true;
+}
+
+bool PetwalkClockSyncButton::parse_time_(uint8_t &hour, uint8_t &minute) const {
+  if (this->display_ == nullptr)
+    return false;
+  const auto &d = this->display_->get_raw_digits();
+  for (char value : d) {
+    if (value < '0' || value > '9')
+      return false;
+  }
+  const uint8_t parsed_hour = static_cast<uint8_t>((d[0] - '0') * 10 + (d[1] - '0'));
+  const uint8_t parsed_minute = static_cast<uint8_t>((d[2] - '0') * 10 + (d[3] - '0'));
+  if (parsed_hour > 23 || parsed_minute > 59)
+    return false;
+  hour = parsed_hour;
+  minute = parsed_minute;
+  return true;
+}
+
+int8_t PetwalkClockSyncButton::shortest_delta_(uint8_t current, uint8_t target, uint8_t modulo) const {
+  int16_t delta = (static_cast<int16_t>(target) - static_cast<int16_t>(current) + modulo) % modulo;
+  if (delta > modulo / 2)
+    delta -= modulo;
+  return static_cast<int8_t>(delta);
+}
+
+void PetwalkClockSyncButton::press_action() {
+  if (this->state_ != State::IDLE) {
+    ESP_LOGW(TAG, "Clock sync is already running");
+    return;
+  }
+  if (this->display_ == nullptr || this->clock_ == nullptr || this->transmitter_ == nullptr) {
+    ESP_LOGE(TAG, "Clock sync cannot start: display, time source or transmitter is missing");
+    return;
+  }
+
+  const auto now = this->clock_->now();
+  if (!now.is_valid()) {
+    ESP_LOGE(TAG, "Clock sync cannot start: ESPHome time is not valid");
+    return;
+  }
+  if (static_cast<uint32_t>(millis() - this->display_->get_last_frame_time()) > 1000) {
+    ESP_LOGE(TAG, "Clock sync cannot start: no current display frames");
+    return;
+  }
+
+  uint16_t target_total = static_cast<uint16_t>(now.hour) * 60U + now.minute + this->target_lead_minutes_;
+  target_total %= 24U * 60U;
+  this->target_hour_ = static_cast<uint8_t>(target_total / 60U);
+  this->target_minute_ = static_cast<uint8_t>(target_total % 60U);
+  this->previous_value_valid_ = false;
+  this->aborting_ = false;
+  this->reset_menu_detection_();
+
+  ESP_LOGI(TAG, "Clock sync started; target is %02u:%02u", this->target_hour_, this->target_minute_);
+  this->send_key_(this->menu_command_);
+  this->set_state_(State::WAIT_MENU, this->state_timeout_ms_);
+}
+
+void PetwalkClockSyncButton::fail_(const char *reason) {
+  ESP_LOGE(TAG, "Clock sync failed: %s", reason);
+  this->start_abort_();
+}
+
+void PetwalkClockSyncButton::start_abort_() {
+  if (this->aborting_)
+    return;
+  this->aborting_ = true;
+  // Emergency exit is two logical MENU key presses. Each logical press itself
+  // consists of two RC5 commands separated by 82 ms.
+  this->send_key_(this->menu_command_);
+  this->not_before_ms_ = millis() + this->second_press_delay_ms_;
+  this->set_state_(State::ABORT_WAIT_SECOND_MENU, this->second_press_delay_ms_ + 1000);
+}
+
+void PetwalkClockSyncButton::loop() {
+  if (this->state_ == State::IDLE)
+    return;
+
+  const uint32_t now_ms = millis();
+  if (this->state_deadline_ms_ != 0 && static_cast<int32_t>(now_ms - this->state_deadline_ms_) >= 0 &&
+      this->state_ != State::WAIT_TARGET_MINUTE && this->state_ != State::ABORT_WAIT_SECOND_MENU &&
+      this->state_ != State::ABORT_FINISH) {
+    this->fail_("timeout while waiting for the expected display state");
+    return;
+  }
+
+  uint8_t hour = 0;
+  uint8_t minute = 0;
+
+  switch (this->state_) {
+    case State::IDLE:
+      break;
+
+    case State::WAIT_MENU:
+      if (this->menu_pattern_detected_()) {
+        ESP_LOGI(TAG, "Clock sync: menu mode detected");
+        this->send_key_(this->time_program_command_);
+        this->set_state_(State::WAIT_24H, this->state_timeout_ms_);
+      }
+      break;
+
+    case State::WAIT_24H:
+      if (this->display_->seen_recently("24h ", 1500)) {
+        ESP_LOGI(TAG, "Clock sync: 24h display detected");
+        this->send_key_(this->ok_command_);
+        this->set_state_(State::WAIT_HOUR, this->state_timeout_ms_);
+      }
+      break;
+
+    case State::WAIT_HOUR:
+      if (!this->parse_hour_(hour))
+        break;
+      {
+        const int8_t delta = this->shortest_delta_(hour, this->target_hour_, 24);
+        if (delta == 0) {
+          ESP_LOGI(TAG, "Clock sync: hour set to %02u", hour);
+          this->send_key_(this->ok_command_);
+          this->set_state_(State::WAIT_MINUTE, this->state_timeout_ms_);
+        } else {
+          this->previous_value_ = hour;
+          this->previous_value_valid_ = true;
+          this->send_key_(delta > 0 ? this->up_command_ : this->down_command_);
+          this->set_state_(State::WAIT_HOUR_STEP, this->step_timeout_ms_);
+        }
+      }
+      break;
+
+    case State::WAIT_HOUR_STEP:
+      if (this->parse_hour_(hour) && this->previous_value_valid_ && hour != this->previous_value_) {
+        this->previous_value_valid_ = false;
+        this->set_state_(State::WAIT_HOUR, this->state_timeout_ms_);
+      }
+      break;
+
+    case State::WAIT_MINUTE:
+      if (!this->parse_time_(hour, minute))
+        break;
+      {
+        const int8_t delta = this->shortest_delta_(minute, this->target_minute_, 60);
+        if (delta == 0) {
+          ESP_LOGI(TAG, "Clock sync: display prepared at %02u:%02u; waiting for system minute", hour, minute);
+          this->set_state_(State::WAIT_TARGET_MINUTE, 180000);
+        } else {
+          this->previous_value_ = minute;
+          this->previous_value_valid_ = true;
+          this->send_key_(delta > 0 ? this->up_command_ : this->down_command_);
+          this->set_state_(State::WAIT_MINUTE_STEP, this->step_timeout_ms_);
+        }
+      }
+      break;
+
+    case State::WAIT_MINUTE_STEP:
+      if (this->parse_time_(hour, minute) && this->previous_value_valid_ && minute != this->previous_value_) {
+        this->previous_value_valid_ = false;
+        this->set_state_(State::WAIT_MINUTE, this->state_timeout_ms_);
+      }
+      break;
+
+    case State::WAIT_TARGET_MINUTE: {
+      const auto now = this->clock_->now();
+      if (!now.is_valid()) {
+        this->fail_("time source became invalid");
+        break;
+      }
+      if (now.hour == this->target_hour_ && now.minute == this->target_minute_ && now.second == 0) {
+        // First logical OK press: save the configured time. The petWALK clock
+        // starts running immediately when this key press is accepted.
+        ESP_LOGI(TAG, "Clock sync: saving at system time %02u:%02u:%02u", now.hour, now.minute, now.second);
+        this->send_key_(this->ok_command_);
+        this->not_before_ms_ = now_ms + this->second_press_delay_ms_;
+        this->set_state_(State::WAIT_AFTER_SAVE, this->second_press_delay_ms_ + this->state_timeout_ms_);
+      } else if (static_cast<uint32_t>(now_ms - this->state_since_ms_) > 180000) {
+        this->fail_("target minute was not reached in time");
+      }
+      break;
+    }
+
+    case State::WAIT_AFTER_SAVE:
+      if (static_cast<int32_t>(now_ms - this->not_before_ms_) >= 0) {
+        // Second separate logical OK key press after two seconds: leave menu.
+        this->send_key_(this->ok_command_);
+        this->not_before_ms_ = now_ms + 1500;
+        this->set_state_(State::WAIT_AFTER_EXIT, this->state_timeout_ms_);
+      }
+      break;
+
+    case State::WAIT_AFTER_EXIT:
+      if (static_cast<int32_t>(now_ms - this->not_before_ms_) >= 0) {
+        ESP_LOGI(TAG, "Clock sync completed successfully");
+        this->state_ = State::IDLE;
+        this->aborting_ = false;
+      }
+      break;
+
+    case State::ABORT_WAIT_SECOND_MENU:
+      if (static_cast<int32_t>(now_ms - this->not_before_ms_) >= 0) {
+        this->send_key_(this->menu_command_);
+        this->not_before_ms_ = now_ms + 1500;
+        this->set_state_(State::ABORT_FINISH, this->state_timeout_ms_);
+      }
+      break;
+
+    case State::ABORT_FINISH:
+      if (static_cast<int32_t>(now_ms - this->not_before_ms_) >= 0) {
+        ESP_LOGW(TAG, "Clock sync aborted; two logical MENU presses were sent");
+        this->state_ = State::IDLE;
+        this->aborting_ = false;
+      }
+      break;
+  }
 }
 
 void PetwalkEsphome::setup() {
@@ -227,6 +539,7 @@ void PetwalkEsphome::dump_config() {
   ESP_LOGCONFIG(TAG, "  Registered binary sensors: %u", static_cast<unsigned>(this->binary_sensors_.size()));
   ESP_LOGCONFIG(TAG, "  Registered switches: %u", static_cast<unsigned>(this->switches_.size()));
   ESP_LOGCONFIG(TAG, "  Registered display text sensors: %u", static_cast<unsigned>(this->text_sensors_.size()));
+  ESP_LOGCONFIG(TAG, "  Registered clock sync buttons: %u", static_cast<unsigned>(this->clock_sync_buttons_.size()));
 }
 
 void IRAM_ATTR PetwalkEsphome::clock_isr(PetwalkEsphome *arg) { arg->handle_clock_isr_(); }
@@ -285,6 +598,8 @@ void PetwalkEsphome::process_frame_(uint8_t buffer_index) {
     petwalk_switch->publish_from_frame(frame.data(), this->frame_bits_);
   for (auto *text_sensor : this->text_sensors_)
     text_sensor->publish_from_frame(frame.data(), this->frame_bits_);
+  for (auto *button : this->clock_sync_buttons_)
+    button->publish_from_frame(frame.data(), this->frame_bits_);
 
   if (this->debug_frames_) {
     std::string text;
