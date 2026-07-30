@@ -139,7 +139,7 @@ char PetwalkDisplayTextSensor::decode_mask_(uint8_t mask) const {
     case 0b0001101: return 'c';
     case 0b0111101: return 'd';
     case 0b0010111: return 'h';
-    case 0b0010000: return 'i';
+    case 0b0000100: return 'i';
     case 0b0010101: return 'n';
     case 0b0011101: return 'o';
     case 0b0000101: return 'r';
