@@ -400,7 +400,7 @@ void PetwalkClockSyncButton::loop() {
       break;
 
     case State::WAIT_24H:
-      if (this->display_->seen_recently("24h ", 1500)) {
+      if (this->display_->seen_recently(" 24h", 1500)) {
         ESP_LOGI(TAG, "Clock sync: 24h display detected");
         this->send_key_(this->ok_command_);
         this->set_state_(State::WAIT_HOUR, this->state_timeout_ms_);
