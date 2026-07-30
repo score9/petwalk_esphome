@@ -3,7 +3,7 @@ import esphome.config_validation as cv
 from esphome.components import button, remote_base, time
 from esphome.const import CONF_ADDRESS, CONF_ID
 
-from .. import PetwalkEsphome, petwalk_ns
+from . import PetwalkEsphome, petwalk_ns
 from .text_sensor import PetwalkDisplayTextSensor
 
 DEPENDENCIES = ["petwalk_esphome", "remote_transmitter", "time"]
