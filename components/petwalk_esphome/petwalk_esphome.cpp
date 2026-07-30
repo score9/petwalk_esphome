@@ -17,21 +17,16 @@ void PetwalkBitBinarySensor::publish_from_frame(const uint8_t *frame, uint8_t fr
   const bool state = this->active_low_ ? !raw : raw;
   const uint32_t now = millis();
 
-  // A changed raw value starts a new candidate period. If it changes back before
-  // the configured time expires, the short pulse is discarded automatically.
   if (!this->candidate_valid_ || state != this->candidate_state_) {
     this->candidate_valid_ = true;
     this->candidate_state_ = state;
     this->candidate_since_ms_ = now;
   }
 
-  // No need to republish the state that Home Assistant already knows.
   if (this->published_valid_ && this->candidate_state_ == this->published_state_)
     return;
 
   const uint32_t required_ms = this->candidate_state_ ? this->minimum_on_time_ms_ : this->minimum_off_time_ms_;
-
-  // Unsigned subtraction intentionally handles millis() rollover.
   if (static_cast<uint32_t>(now - this->candidate_since_ms_) < required_ms)
     return;
 
@@ -40,11 +35,57 @@ void PetwalkBitBinarySensor::publish_from_frame(const uint8_t *frame, uint8_t fr
   this->publish_state(this->published_state_);
 }
 
+void PetwalkBitSwitch::publish_from_frame(const uint8_t *frame, uint8_t frame_bits) {
+  if (this->bit_ == 0 || this->bit_ > frame_bits)
+    return;
+
+  const bool raw = frame[this->bit_ - 1] != 0;
+  const bool state = this->active_low_ ? !raw : raw;
+  const uint32_t now = millis();
+
+  if (!this->candidate_valid_ || state != this->candidate_state_) {
+    this->candidate_valid_ = true;
+    this->candidate_state_ = state;
+    this->candidate_since_ms_ = now;
+  }
+
+  if (this->published_valid_ && this->candidate_state_ == this->published_state_)
+    return;
+
+  const uint32_t required_ms = this->candidate_state_ ? this->minimum_on_time_ms_ : this->minimum_off_time_ms_;
+  if (static_cast<uint32_t>(now - this->candidate_since_ms_) < required_ms)
+    return;
+
+  this->published_state_ = this->candidate_state_;
+  this->published_valid_ = true;
+  this->publish_state(this->published_state_);
+}
+
+void PetwalkBitSwitch::write_state(bool state) {
+  // The petWALK RC5 command is a toggle command. The requested state is therefore
+  // not published optimistically; the display-bus bit remains the source of truth.
+  if (this->published_valid_ && state == this->published_state_)
+    return;
+
+  if (this->transmitter_ == nullptr) {
+    ESP_LOGE(TAG, "Cannot send RC5 command: no remote transmitter configured");
+    return;
+  }
+
+  remote_base::RC5Data data{};
+  data.address = this->address_;
+  data.command = this->command_;
+  this->transmitter_->transmit<remote_base::RC5Protocol>(data, this->repeat_times_, this->repeat_wait_us_);
+
+  ESP_LOGD(TAG, "Sent RC5 for bit %u: address=0x%02X command=0x%02X repeats=%u wait=%u us",
+           this->bit_, this->address_, this->command_, static_cast<unsigned>(this->repeat_times_),
+           static_cast<unsigned>(this->repeat_wait_us_));
+}
+
 void PetwalkEsphome::setup() {
   this->data_pin_->setup();
   this->clock_pin_->setup();
   this->latch_pin_->setup();
-
   this->data_isr_pin_ = this->data_pin_->to_isr();
 
   const auto clock_interrupt = this->clock_edge_ == CLOCK_EDGE_FALLING
@@ -56,8 +97,6 @@ void PetwalkEsphome::setup() {
 
   this->clock_pin_->attach_interrupt(&PetwalkEsphome::clock_isr, this, clock_interrupt);
   this->latch_pin_->attach_interrupt(&PetwalkEsphome::latch_isr, this, latch_interrupt);
-
-  // Nothing to process until the first complete frame arrives.
   this->disable_loop();
 }
 
@@ -70,14 +109,13 @@ void PetwalkEsphome::dump_config() {
   ESP_LOGCONFIG(TAG, "  CLOCK sampling edge: %s", this->clock_edge_ == CLOCK_EDGE_FALLING ? "FALLING" : "RISING");
   ESP_LOGCONFIG(TAG, "  LATCH frame-start edge: %s", this->latch_edge_ == LATCH_EDGE_FALLING ? "FALLING" : "RISING");
   ESP_LOGCONFIG(TAG, "  Registered binary sensors: %u", static_cast<unsigned>(this->binary_sensors_.size()));
+  ESP_LOGCONFIG(TAG, "  Registered switches: %u", static_cast<unsigned>(this->switches_.size()));
 }
 
 void IRAM_ATTR PetwalkEsphome::clock_isr(PetwalkEsphome *arg) { arg->handle_clock_isr_(); }
-
 void IRAM_ATTR PetwalkEsphome::latch_isr(PetwalkEsphome *arg) { arg->handle_latch_isr_(); }
 
 void IRAM_ATTR PetwalkEsphome::handle_latch_isr_() {
-  // The selected LATCH edge marks the start of a new 56-bit frame.
   this->bit_index_ = 0;
   this->receiving_ = true;
 }
@@ -115,7 +153,6 @@ void PetwalkEsphome::loop() {
   this->process_frame_(completed);
   this->processed_sequence_ = sequence;
 
-  // If no newer frame arrived while processing, sleep until the next ISR wakeup.
   if (this->completed_sequence_ == this->processed_sequence_)
     this->disable_loop();
 }
@@ -127,6 +164,8 @@ void PetwalkEsphome::process_frame_(uint8_t buffer_index) {
 
   for (auto *sensor : this->binary_sensors_)
     sensor->publish_from_frame(frame.data(), this->frame_bits_);
+  for (auto *petwalk_switch : this->switches_)
+    petwalk_switch->publish_from_frame(frame.data(), this->frame_bits_);
 
   if (this->debug_frames_) {
     std::string text;
