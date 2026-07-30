@@ -183,10 +183,10 @@ class PetwalkClockSyncButton : public button::Button, public Component {
   uint8_t ok_command_{0x11};
   uint8_t time_program_command_{0x15};
   uint32_t repeat_wait_us_{82000};
-  uint32_t second_press_delay_ms_{2000};
+  uint32_t second_press_delay_ms_{3000};
   uint32_t step_timeout_ms_{2500};
   uint32_t state_timeout_ms_{5000};
-  uint8_t target_lead_minutes_{2};
+  uint8_t target_lead_minutes_{1};
 
   State state_{State::IDLE};
   uint32_t state_since_ms_{0};
@@ -197,6 +197,7 @@ class PetwalkClockSyncButton : public button::Button, public Component {
   uint8_t previous_value_{0};
   bool previous_value_valid_{false};
   bool aborting_{false};
+  uint8_t exit_retry_count_{0};
 
   static constexpr std::array<uint8_t, 7> MENU_BITS{{2, 4, 9, 11, 13, 15, 23}};
   std::array<bool, 7> menu_last_states_{};
