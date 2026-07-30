@@ -2,12 +2,14 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/remote_base/rc5_protocol.h"
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/components/switch/switch.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
 
@@ -79,6 +81,38 @@ class PetwalkBitSwitch : public switch_::Switch {
   uint32_t repeat_wait_us_{0};
 };
 
+
+class PetwalkDisplayTextSensor : public text_sensor::TextSensor {
+ public:
+  void set_active_low(bool active_low) { this->active_low_ = active_low; }
+  void set_minimum_state_time(uint32_t milliseconds) { this->minimum_state_time_ms_ = milliseconds; }
+  void set_insert_time_separator(bool insert) { this->insert_time_separator_ = insert; }
+  void set_time_separator(const std::string &separator) {
+    if (!separator.empty())
+      this->time_separator_ = separator[0];
+  }
+  void set_trim_spaces(bool trim_spaces) { this->trim_spaces_ = trim_spaces; }
+  void publish_from_frame(const uint8_t *frame, uint8_t frame_bits);
+
+ protected:
+  bool segment_on_(const uint8_t *frame, uint8_t frame_bits, uint8_t bit) const;
+  char decode_digit_(const uint8_t *frame, uint8_t frame_bits, uint8_t position) const;
+  char decode_mask_(uint8_t mask) const;
+  std::string decode_display_(const uint8_t *frame, uint8_t frame_bits) const;
+
+  bool active_low_{true};
+  uint32_t minimum_state_time_ms_{0};
+  bool insert_time_separator_{true};
+  char time_separator_{'.'};
+  bool trim_spaces_{true};
+
+  bool candidate_valid_{false};
+  std::string candidate_state_{};
+  uint32_t candidate_since_ms_{0};
+  bool published_valid_{false};
+  std::string published_state_{};
+};
+
 class PetwalkEsphome : public Component {
  public:
   void set_data_pin(InternalGPIOPin *pin) { this->data_pin_ = pin; }
@@ -90,6 +124,7 @@ class PetwalkEsphome : public Component {
   void set_debug_frames(bool debug_frames) { this->debug_frames_ = debug_frames; }
   void register_binary_sensor(PetwalkBitBinarySensor *sensor) { this->binary_sensors_.push_back(sensor); }
   void register_switch(PetwalkBitSwitch *petwalk_switch) { this->switches_.push_back(petwalk_switch); }
+  void register_text_sensor(PetwalkDisplayTextSensor *sensor) { this->text_sensors_.push_back(sensor); }
 
   void setup() override;
   void loop() override;
@@ -123,6 +158,7 @@ class PetwalkEsphome : public Component {
 
   std::vector<PetwalkBitBinarySensor *> binary_sensors_;
   std::vector<PetwalkBitSwitch *> switches_;
+  std::vector<PetwalkDisplayTextSensor *> text_sensors_;
 };
 
 }  // namespace petwalk_esphome

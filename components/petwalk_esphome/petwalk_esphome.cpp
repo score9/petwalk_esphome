@@ -82,6 +82,121 @@ void PetwalkBitSwitch::write_state(bool state) {
            static_cast<unsigned>(this->repeat_wait_us_));
 }
 
+
+bool PetwalkDisplayTextSensor::segment_on_(const uint8_t *frame, uint8_t frame_bits, uint8_t bit) const {
+  if (bit == 0 || bit > frame_bits)
+    return false;
+  const bool raw = frame[bit - 1] != 0;
+  return this->active_low_ ? !raw : raw;
+}
+
+char PetwalkDisplayTextSensor::decode_digit_(const uint8_t *frame, uint8_t frame_bits, uint8_t position) const {
+  // petWALK sends the four digits in descending bit ranges:
+  // position 1: G=50 F=51 E=52 D=53 C=54 B=55 A=56
+  // position 2: G=42 F=43 E=44 D=45 C=46 B=47 A=48
+  // position 3: G=34 F=35 E=36 D=37 C=38 B=39 A=40
+  // position 4: G=26 F=27 E=28 D=29 C=30 B=31 A=32
+  if (position < 1 || position > 4)
+    return '?';
+
+  const uint8_t base = static_cast<uint8_t>(58 - position * 8);  // G bit: 50,42,34,26
+  uint8_t mask = 0;
+  if (this->segment_on_(frame, frame_bits, base + 6)) mask |= 0x40;  // A
+  if (this->segment_on_(frame, frame_bits, base + 5)) mask |= 0x20;  // B
+  if (this->segment_on_(frame, frame_bits, base + 4)) mask |= 0x10;  // C
+  if (this->segment_on_(frame, frame_bits, base + 3)) mask |= 0x08;  // D
+  if (this->segment_on_(frame, frame_bits, base + 2)) mask |= 0x04;  // E
+  if (this->segment_on_(frame, frame_bits, base + 1)) mask |= 0x02;  // F
+  if (this->segment_on_(frame, frame_bits, base + 0)) mask |= 0x01;  // G
+  return this->decode_mask_(mask);
+}
+
+char PetwalkDisplayTextSensor::decode_mask_(uint8_t mask) const {
+  // Mask order is A B C D E F G (A = bit 6, G = bit 0).
+  // Duplicate patterns are inherently ambiguous: 0/O and 1/I. We return
+  // the numeric character, which also keeps time decoding deterministic.
+  switch (mask) {
+    case 0b0000000: return ' ';
+    case 0b1111110: return '0';
+    case 0b0110000: return '1';
+    case 0b1101101: return '2';
+    case 0b1111001: return '3';
+    case 0b0110011: return '4';
+    case 0b1011011: return '5';
+    case 0b1011111: return '6';
+    case 0b1110000: return '7';
+    case 0b1111111: return '8';
+    case 0b1111011: return '9';
+    case 0b1110111: return 'A';
+    case 0b1001110: return 'C';
+    case 0b1001111: return 'E';
+    case 0b1000111: return 'F';
+    case 0b0110111: return 'H';
+    case 0b0001110: return 'L';
+    case 0b1100111: return 'P';
+    case 0b0111110: return 'U';
+    case 0b0001101: return 'c';
+    case 0b0111101: return 'd';
+    case 0b0010111: return 'h';
+    case 0b0010000: return 'i';
+    case 0b0010101: return 'n';
+    case 0b0011101: return 'o';
+    case 0b0000101: return 'r';
+    case 0b0011100: return 'u';
+    default: return '?';
+  }
+}
+
+std::string PetwalkDisplayTextSensor::decode_display_(const uint8_t *frame, uint8_t frame_bits) const {
+  std::string digits;
+  digits.reserve(5);
+  bool all_numeric = true;
+
+  for (uint8_t position = 1; position <= 4; position++) {
+    const char value = this->decode_digit_(frame, frame_bits, position);
+    digits.push_back(value);
+    if (value < '0' || value > '9')
+      all_numeric = false;
+  }
+
+  if (this->insert_time_separator_ && all_numeric)
+    digits.insert(digits.begin() + 2, this->time_separator_);
+
+  if (this->trim_spaces_) {
+    const auto first = digits.find_first_not_of(' ');
+    if (first == std::string::npos)
+      return "";
+    const auto last = digits.find_last_not_of(' ');
+    digits = digits.substr(first, last - first + 1);
+  }
+
+  return digits;
+}
+
+void PetwalkDisplayTextSensor::publish_from_frame(const uint8_t *frame, uint8_t frame_bits) {
+  if (frame_bits < 56)
+    return;
+
+  const std::string state = this->decode_display_(frame, frame_bits);
+  const uint32_t now = millis();
+
+  if (!this->candidate_valid_ || state != this->candidate_state_) {
+    this->candidate_valid_ = true;
+    this->candidate_state_ = state;
+    this->candidate_since_ms_ = now;
+  }
+
+  if (this->published_valid_ && this->candidate_state_ == this->published_state_)
+    return;
+
+  if (static_cast<uint32_t>(now - this->candidate_since_ms_) < this->minimum_state_time_ms_)
+    return;
+
+  this->published_state_ = this->candidate_state_;
+  this->published_valid_ = true;
+  this->publish_state(this->published_state_);
+}
+
 void PetwalkEsphome::setup() {
   this->data_pin_->setup();
   this->clock_pin_->setup();
@@ -110,6 +225,7 @@ void PetwalkEsphome::dump_config() {
   ESP_LOGCONFIG(TAG, "  LATCH frame-start edge: %s", this->latch_edge_ == LATCH_EDGE_FALLING ? "FALLING" : "RISING");
   ESP_LOGCONFIG(TAG, "  Registered binary sensors: %u", static_cast<unsigned>(this->binary_sensors_.size()));
   ESP_LOGCONFIG(TAG, "  Registered switches: %u", static_cast<unsigned>(this->switches_.size()));
+  ESP_LOGCONFIG(TAG, "  Registered display text sensors: %u", static_cast<unsigned>(this->text_sensors_.size()));
 }
 
 void IRAM_ATTR PetwalkEsphome::clock_isr(PetwalkEsphome *arg) { arg->handle_clock_isr_(); }
@@ -166,6 +282,8 @@ void PetwalkEsphome::process_frame_(uint8_t buffer_index) {
     sensor->publish_from_frame(frame.data(), this->frame_bits_);
   for (auto *petwalk_switch : this->switches_)
     petwalk_switch->publish_from_frame(frame.data(), this->frame_bits_);
+  for (auto *text_sensor : this->text_sensors_)
+    text_sensor->publish_from_frame(frame.data(), this->frame_bits_);
 
   if (this->debug_frames_) {
     std::string text;
