@@ -2,7 +2,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import text_sensor
 
-from .. import PetwalkEsphome, petwalk_ns
+from . import PetwalkEsphome, petwalk_ns
 
 CONF_PETWALK_ESPHOME_ID = "petwalk_esphome_id"
 CONF_ACTIVE_LOW = "active_low"
